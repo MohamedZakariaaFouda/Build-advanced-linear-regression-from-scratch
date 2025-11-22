@@ -8,6 +8,19 @@ Unlike traditional Linear Regression implementations in libraries like **scikit-
 
 ## Overview
 
+Linear Regression predicts continuous target values.  
+We aim to find parameters `theta` that minimize the **Mean Squared Error (MSE)**.
+
+**Mean Squared Error (MSE):**
+
+ 
+
+Unlike traditional Linear Regression implementations in libraries like **scikit-learn**, which often rely on the **Normal Equation**, this implementation uses **Stochastic / Mini-batch Gradient Descent (SGD)** with **early stopping**, normalization, and regularization.  
+
+---
+
+## Overview
+
 Linear Regression is a supervised learning algorithm used to predict continuous target variables.  
 
 Given a dataset \(X \in \mathbb{R}^{m \times n}\) and target \(y \in \mathbb{R}^{m}\), we aim to learn parameters \(\theta \in \mathbb{R}^{n}\) that minimize the **Mean Squared Error (MSE)**:
