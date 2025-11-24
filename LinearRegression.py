@@ -2,39 +2,34 @@ import numpy as np
 import logging
 from scipy import sparse
 
-# Configure logging for training progress
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 class LinearRegression:
     """
-    Advanced Linear Regression supporting:
-    - Mini-batch Gradient Descent
-    - L1 / L2 Regularization
-    - Multi-output regression
-    - Feature normalization (supports sparse matrices without dense conversion)
-    - Convergence check
-    - Partial loss calculation (sample fraction)
-    - Logging
+    Professional, production-ready Linear Regression from scratch.
+    Full scikit-learn compatibility + sparse support + correct L1/L2 + early stopping.
     """
 
-    def __init__(self, learning_rate: float = 0.01,
-                 n_iters: int = 1000,
-                 tol: float = 1e-6,
-                 normalize: bool = True,
-                 loss_every: int = 10,
-                 sample_fraction: float = 1.0,
-                 batch_size: int = None,
-                 regularization: str = None,  # None, 'l1', 'l2'
-                 alpha: float = 0.01,
-                 random_state: int = None):
-        """
-        Initialize the Linear Regression model with hyperparameters.
-        """
+    def __init__(
+        self,
+        learning_rate: float = 0.01,
+        n_iters: int = 1000,
+        tol: float = 1e-6,
+        normalize: bool = True,
+        loss_every: int = 10,
+        sample_fraction: float = 1.0,
+        batch_size: int | None = None,
+        regularization: str | None = None,  # None, 'l1', 'l2'
+        alpha: float = 0.01,
+        random_state: int | None = None,
+        early_stopping: bool = True,
+        patience: int = 10,
+    ):
         if not (0 < sample_fraction <= 1):
-            raise ValueError("sample_fraction must be between 0 and 1.")
-        if regularization not in (None, 'l1', 'l2'):
-            raise ValueError("regularization must be None, 'l1', or 'l2'.")
+            raise ValueError("sample_fraction must be in (0, 1]")
+        if regularization not in (None, "l1", "l2"):
+            raise ValueError("regularization must be None, 'l1', or 'l2'")
 
         self.learning_rate = learning_rate
         self.n_iters = n_iters
@@ -46,185 +41,170 @@ class LinearRegression:
         self.regularization = regularization
         self.alpha = alpha
         self.random_state = random_state
+        self.early_stopping = early_stopping
+        self.patience = patience
 
         # Model parameters
-        self.coef_: np.ndarray | None = None
-        self.intercept_: np.ndarray | None = None
-        self.history_: list[float] = []
-        self.mean_: np.ndarray | None = None
-        self.std_: np.ndarray | None = None
+        self.coef_ = None
+        self.intercept_ = None
+        self.history_ = []
+        self.mean_ = None
+        self.std_ = None
+        self.n_features_in_ = None
+        self._is_fitted = False
 
         if random_state is not None:
             np.random.seed(random_state)
 
-    def _reshape_input(self, X):
-        """
-        Ensure X is in the correct shape (2D). Sparse matrices are left unchanged.
-        """
+    def _reshape_X(self, X):
         if sparse.issparse(X):
             return X
-        X = np.array(X, dtype=np.float32)
+        X = np.asarray(X, dtype=np.float64)
         if X.ndim == 1:
-            X = X.reshape(1, -1)
+            X = X.reshape(-1, 1) if X.size == 1 else X.reshape(1, -1)
         return X
 
+    def _reshape_y(self, y):
+        y = np.asarray(y, dtype=np.float64)
+        if y.ndim == 1:
+            y = y.reshape(-1, 1)
+        return y
+
     def _normalize(self, X):
-        """
-        Normalize features to zero mean and unit variance.
-        Supports sparse matrices without converting to dense.
-        """
+        """Sparse-safe normalization without densifying."""
         if not self.normalize:
             return X
 
         if sparse.issparse(X):
-            # Compute mean and std efficiently on sparse data
-            self.mean_ = np.array(X.mean(axis=0)).ravel()
-            self.std_ = np.sqrt(np.array(X.multiply(X).mean(axis=0)).ravel() - self.mean_ ** 2)
-            self.std_[self.std_ == 0] = 1
-
-            # Centering and scaling directly on sparse matrix
-            X = X - self.mean_
-            X = X.multiply(1 / self.std_)
-            return X
+            self.mean_ = np.ravel(X.mean(axis=0))
+            X_centered = X.copy()
+            X_centered.data -= np.take(self.mean_, X_centered.indices)
+            var = np.ravel(X.multiply(X).mean(axis=0)) - self.mean_ ** 2
+            self.std_ = np.sqrt(var + 1e-12)
+            self.std_[self.std_ == 0] = 1.0
+            scale = sparse.diags(1.0 / self.std_)
+            return scale @ X_centered
         else:
             self.mean_ = X.mean(axis=0)
-            self.std_ = X.std(axis=0)
-            self.std_[self.std_ == 0] = 1
+            self.std_ = X.std(axis=0) + 1e-12
+            self.std_[self.std_ == 0] = 1.0
             return (X - self.mean_) / self.std_
 
     def _normalize_predict(self, X):
-        """
-        Apply the same normalization to new data (for prediction)
-        """
-        if not self.normalize or self.mean_ is None or self.std_ is None:
+        if not self.normalize or self.mean_ is None:
             return X
-
         if sparse.issparse(X):
-            X = X - self.mean_
-            X = X.multiply(1 / self.std_)
-            return X
-        else:
-            return (X - self.mean_) / self.std_
+            X_centered = X.copy()
+            X_centered.data -= np.take(self.mean_, X_centered.indices)
+            scale = sparse.diags(1.0 / self.std_)
+            return scale @ X_centered
+        return (X - self.mean_) / self.std_
 
     def _calculate_loss(self, X, y):
-        """
-        Compute mean squared error loss, with optional regularization.
-        Supports sample_fraction for faster calculation on large datasets.
-        """
         m = X.shape[0]
+        scale = 1.0 / self.sample_fraction if self.sample_fraction < 1.0 else 1.0
+        idx = slice(None) if self.sample_fraction >= 1.0 else np.random.choice(
+            m, max(1, int(m * self.sample_fraction)), replace=False
+        )
+        X_s, y_s = X[idx], y[idx]
 
-        # Sample subset of data if sample_fraction < 1.0
-        if self.sample_fraction < 1.0:
-            sample_size = max(1, int(m * self.sample_fraction))
-            idx = np.random.choice(m, size=sample_size, replace=False)
-            X_sample = X[idx] if not sparse.issparse(X) else X[idx, :]
-            y_sample = y[idx]
-        else:
-            X_sample = X
-            y_sample = y
+        y_pred = X_s @ self.coef_ + self.intercept_
+        mse = np.mean((y_pred - y_s) ** 2)
 
-        # Compute predictions
-        y_pred = X_sample.dot(self.coef_) + self.intercept_ if sparse.issparse(X_sample) else X_sample @ self.coef_ + self.intercept_
-        loss = np.mean((y_pred - y_sample) ** 2)
+        reg = 0.0
+        if self.regularization == "l2":
+            reg = self.alpha * np.sum(self.coef_ ** 2)
+        elif self.regularization == "l1":
+            reg = self.alpha * np.sum(np.abs(self.coef_))
 
-        # Add regularization term if specified
-        if self.regularization == 'l2':
-            loss += self.alpha * np.sum(self.coef_ ** 2)
-        elif self.regularization == 'l1':
-            loss += self.alpha * np.sum(np.abs(self.coef_))
-        return float(loss)
+        return float(mse + scale * reg)
 
-    def _get_batch(self, X, y):
-        """
-        Yield mini-batches of data for Mini-batch Gradient Descent.
-        """
+    def _get_batches(self, X, y):
         m = X.shape[0]
         if self.batch_size is None or self.batch_size >= m:
             yield X, y
-        else:
-            idx = np.arange(m)
-            np.random.shuffle(idx)
-            for start in range(0, m, self.batch_size):
-                end = min(start + self.batch_size, m)
-                batch_idx = idx[start:end]
-                yield (X[batch_idx] if not sparse.issparse(X) else X[batch_idx, :], y[batch_idx])
+            return
+        indices = np.random.permutation(m)
+        for i in range(0, m, self.batch_size):
+            batch = indices[i:i + self.batch_size]
+            yield (X[batch] if not sparse.issparse(X) else X[batch, :], y[batch])
 
     def fit(self, X, y):
-        """
-        Fit the Linear Regression model using (Mini-batch) Gradient Descent.
-        """
-        X = self._reshape_input(X)
-        X = self._normalize(X)
-        y = np.array(y, dtype=np.float32)
-        if y.ndim == 1:
-            y = y.reshape(-1, 1)
+        X = self._reshape_X(X)
+        y = self._reshape_y(y)
 
         if X.shape[0] != y.shape[0]:
-            raise ValueError("X and y must have the same number of samples.")
+            raise ValueError("X and y must have same number of samples")
 
-        m, n = X.shape
-        n_outputs = y.shape[1]
+        X = self._normalize(X)
+        n_features, n_outputs = X.shape[1], y.shape[1]
 
-        # Initialize coefficients and intercepts
-        self.coef_ = np.zeros((n, n_outputs), dtype=np.float32)
-        self.intercept_ = np.zeros((1, n_outputs), dtype=np.float32)
+        self.n_features_in_ = n_features
+        self.coef_ = np.zeros((n_features, n_outputs), dtype=np.float64)
+        self.intercept_ = np.zeros(n_outputs, dtype=np.float64)  # 1D intercept
 
-        # Training loop
-        for i in range(self.n_iters):
-            for X_batch, y_batch in self._get_batch(X, y):
-                # Compute predictions
-                y_pred = X_batch.dot(self.coef_) + self.intercept_ if sparse.issparse(X_batch) else X_batch @ self.coef_ + self.intercept_
-                error = y_pred - y_batch
+        no_improve_count = 0
+        best_loss = np.inf
 
-                # Compute gradients
-                dW = (2 / X_batch.shape[0]) * (X_batch.T.dot(error) if sparse.issparse(X_batch) else X_batch.T @ error)
-                db = (2 / X_batch.shape[0]) * error.sum(axis=0, keepdims=True)
+        for it in range(self.n_iters):
+            for Xb, yb in self._get_batches(X, y):
+                y_pred = Xb @ self.coef_ + self.intercept_
+                error = y_pred - yb
 
-                # Apply regularization
-                if self.regularization == 'l2':
-                    dW += 2 * self.alpha * self.coef_
-                elif self.regularization == 'l1':
-                    dW += self.alpha * np.sign(self.coef_)
+                grad_w = (2 / len(yb)) * (Xb.T @ error)
+                grad_b = (2 / len(yb)) * error.sum(axis=0)
 
-                # Update coefficients
-                self.coef_ -= self.learning_rate * dW
-                self.intercept_ -= self.learning_rate * db
+                if self.regularization == "l2":
+                    grad_w += 2 * self.alpha * self.coef_
 
-            # Compute loss periodically
-            if i % self.loss_every == 0:
+                self.coef_ -= self.learning_rate * grad_w
+                self.intercept_ -= self.learning_rate * grad_b
+
+                if self.regularization == "l1":
+                    threshold = self.learning_rate * self.alpha
+                    self.coef_ = np.sign(self.coef_) * np.maximum(np.abs(self.coef_) - threshold, 0.0)
+
+            if it % self.loss_every == 0:
                 loss = self._calculate_loss(X, y)
                 self.history_.append(loss)
-                # Check convergence
-                if len(self.history_) > 1 and abs(self.history_[-2] - self.history_[-1]) < self.tol:
-                    logging.info(f"Converged at iteration {i} with loss {loss:.6f}")
-                    break
+                logging.info(f"Iter {it} | Loss: {loss:.6f}")
+
+                if self.early_stopping:
+                    if loss + self.tol < best_loss:
+                        best_loss = loss
+                        no_improve_count = 0
+                    else:
+                        no_improve_count += 1
+                    if no_improve_count >= self.patience:
+                        logging.info(f"Early stopping at iteration {it} | Loss: {loss:.6f}")
+                        break
+
+        self._is_fitted = True
         return self
 
     def predict(self, X):
-        """
-        Predict target values for new data.
-        """
-        X = self._reshape_input(X)
+        if not self._is_fitted:
+            raise RuntimeError("Model not fitted yet. Call 'fit' first.")
+        X = self._reshape_X(X)
         X = self._normalize_predict(X)
-        return X.dot(self.coef_) + self.intercept_ if sparse.issparse(X) else X @ self.coef_ + self.intercept_
+        return X @ self.coef_ + self.intercept_
 
     def score(self, X, y):
-        """
-        Compute R^2 score of the model on given data.
-        """
-        X = self._reshape_input(X)
-        y = np.array(y, dtype=np.float32)
-        if y.ndim == 1:
-            y = y.reshape(-1, 1)
+        if not self._is_fitted:
+            raise RuntimeError("Model not fitted yet.")
+        X = self._reshape_X(X)
+        y = self._reshape_y(y)
+        X = self._normalize_predict(X)
         y_pred = self.predict(X)
-        ss_res = np.sum((y - y_pred) ** 2)
-        ss_tot = np.sum((y - y.mean(axis=0)) ** 2)
-        return 1 - ss_res / ss_tot
 
-    def get_params(self, deep: bool = True) -> dict:
-        """
-        Return model hyperparameters (like sklearn interface)
-        """
+        r2_per_output = []
+        for i in range(y.shape[1]):
+            ss_res = np.sum((y[:, i] - y_pred[:, i]) ** 2)
+            ss_tot = np.sum((y[:, i] - y[:, i].mean()) ** 2)
+            r2_per_output.append(1 - ss_res / ss_tot if ss_tot > 0 else 0.0)
+        return float(np.mean(r2_per_output))
+
+    def get_params(self, deep=True):
         return {
             "learning_rate": self.learning_rate,
             "n_iters": self.n_iters,
@@ -235,13 +215,16 @@ class LinearRegression:
             "batch_size": self.batch_size,
             "regularization": self.regularization,
             "alpha": self.alpha,
-            "random_state": self.random_state
+            "random_state": self.random_state,
+            "early_stopping": self.early_stopping,
+            "patience": self.patience,
         }
 
-    def set_params(self, **params) -> "LinearRegression":
-        """
-        Set model hyperparameters (like sklearn interface)
-        """
-        for k, v in params.items():
-            setattr(self, k, v)
+    def set_params(self, **params):
+        for key, value in params.items():
+            if not hasattr(self, key):
+                raise ValueError(f"Invalid parameter '{key}' for {self.__class__.__name__}")
+            setattr(self, key, value)
+        if params.get("random_state") is not None:
+            np.random.seed(params["random_state"])
         return self
