@@ -61,7 +61,7 @@ class LinearRegression:
             return X
         X = np.asarray(X, dtype=np.float64)
         if X.ndim == 1:
-            X = X.reshape(-1, 1) if X.size == 1 else X.reshape(1, -1)
+            X = X.reshape(-1, 1)
         return X
 
     def _reshape_y(self, y):
